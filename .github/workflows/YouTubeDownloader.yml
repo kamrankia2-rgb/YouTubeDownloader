@@ -30,6 +30,16 @@ on:
         required: false
         type: string
         default: '720'
+      trim_start:
+        description: '✂️ Trim Start Time (e.g., 00:01:30 or 90 - leave empty for no trim)'
+        required: false
+        type: string
+        default: ''
+      trim_end:
+        description: '✂️ Trim End Time (e.g., 00:03:45 or 225 - leave empty for no trim)'
+        required: false
+        type: string
+        default: ''
       max_videos:
         description: '🔢 Max results'
         required: false
@@ -69,6 +79,7 @@ jobs:
           python3 -c "import requests" 2>/dev/null || pip3 install -q requests
           command -v yt-dlp &>/dev/null || pip3 install -q yt-dlp
           command -v zip &>/dev/null || (sudo apt-get update -qq && sudo apt-get install -y -qq zip)
+          command -v ffmpeg &>/dev/null || (sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg)
 
       - name: 🔗 Prepare
         id: prep
@@ -86,6 +97,8 @@ jobs:
           URL: ${{ steps.prep.outputs.URL }}
           TYPE: ${{ github.event.inputs.type }}
           QUALITY: ${{ github.event.inputs.quality }}
+          TRIM_START: ${{ github.event.inputs.trim_start }}
+          TRIM_END: ${{ github.event.inputs.trim_end }}
           MAX: ${{ github.event.inputs.max_videos }}
           SPLIT: ${{ github.event.inputs.split_threshold_mb }}
         run: |
@@ -101,6 +114,8 @@ jobs:
           Q = os.environ.get('QUALITY', '720')
           MX = int(os.environ.get('MAX', '10'))
           SP = int(os.environ.get('SPLIT', '50'))
+          TRIM_START = os.environ.get('TRIM_START', '').strip()
+          TRIM_END = os.environ.get('TRIM_END', '').strip()
 
           API = 'https://hub.ytconvert.org/api/download'
           H = {
@@ -110,6 +125,65 @@ jobs:
               'Content-Type': 'application/json',
               'Origin': 'https://media.ytmp3.gg'
           }
+
+          def time_to_seconds(time_str):
+              """Convert time string (HH:MM:SS, MM:SS, or seconds) to seconds"""
+              if not time_str:
+                  return None
+              
+              time_str = time_str.strip()
+              
+              # Try direct integer (seconds)
+              try:
+                  return int(time_str)
+              except ValueError:
+                  pass
+              
+              # Try HH:MM:SS or MM:SS format
+                  parts = time_str.split(':')
+              if len(parts) == 3:  # HH:MM:SS
+                  return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+              elif len(parts) == 2:  # MM:SS
+                  return int(parts[0]) * 60 + int(parts[1])
+              else:
+                  raise ValueError(f"Invalid time format: {time_str}")
+
+          def trim_video(input_path, output_path, start_time, end_time):
+              """Trim video using ffmpeg"""
+              if not start_time and not end_time:
+                  return True
+              
+              cmd = ['ffmpeg', '-i', str(input_path), '-c', 'copy', '-map', '0']
+              
+              if start_time:
+                  cmd.extend(['-ss', str(start_time)])
+              if end_time:
+                  duration = end_time - (start_time or 0)
+                  cmd.extend(['-t', str(duration)])
+              
+              cmd.append(str(output_path))
+              
+              # Add -y to overwrite output file without asking
+              cmd.insert(1, '-y')
+              
+              try:
+                  print(f'   ✂️ Trimming video...')
+                  if start_time:
+                      print(f'      Start: {start_time}s')
+                  if end_time:
+                      print(f'      End: {end_time}s')
+                      print(f'      Duration: {end_time - (start_time or 0)}s')
+                  
+                  result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+                  if result.returncode == 0:
+                      print(f'   ✅ Trimmed successfully')
+                      return True
+                  else:
+                      print(f'   ⚠️ FFmpeg error: {result.stderr[:200]}')
+                      return False
+              except Exception as e:
+                  print(f'   ❌ Trimming failed: {e}')
+                  return False
 
           def safe_name(text, maxlen=40):
               safe = re.sub(r'[^\w]', '_', text)[:maxlen]
@@ -343,6 +417,27 @@ jobs:
                   return True
               return False
 
+          # Parse trim times
+          try:
+              start_sec = time_to_seconds(TRIM_START) if TRIM_START else None
+              end_sec = time_to_seconds(TRIM_END) if TRIM_END else None
+              
+              if start_sec is not None and start_sec < 0:
+                  print('❌ Start time cannot be negative')
+                  sys.exit(1)
+              if end_sec is not None and end_sec < 0:
+                  print('❌ End time cannot be negative')
+                  sys.exit(1)
+              if start_sec is not None and end_sec is not None and start_sec >= end_sec:
+                  print('❌ Start time must be less than end time')
+                  sys.exit(1)
+              
+              if start_sec is not None or end_sec is not None:
+                  print(f'✂️ Trimming enabled: {TRIM_START or "0"} → {TRIM_END or "end"}')
+          except ValueError as e:
+              print(f'❌ Invalid time format: {e}')
+              sys.exit(1)
+
           print(f'{"="*50}')
           print(f'🎬 {M.upper()} MODE')
           print(f'{"="*50}')
@@ -393,6 +488,15 @@ jobs:
                       size = download_file(result['u'], fp)
                       if size:
                           print(f'   ✅ Downloaded ({size/1e6:.1f}MB)')
+                          
+                          # Apply trimming if specified
+                          if start_sec is not None or end_sec is not None:
+                              trimmed_fp = cd / f'v{i:03d}_{x["id"]}_trimmed.{result["e"]}'
+                              if trim_video(fp, trimmed_fp, start_sec, end_sec):
+                                  fp.unlink()  # Remove original
+                                  fp = trimmed_fp  # Use trimmed version for splitting
+                                  print(f'   ✅ Trimmed version saved')
+                          
                           split_file(fp, SP)
                           ok.append(x['t'])
                       else:
@@ -431,7 +535,18 @@ jobs:
                   size = download_file(result['u'], fp)
                   if size:
                       print(f'✅ Saved to {cn}_videos/ ({size/1e6:.1f}MB)')
+                      
+                      # Apply trimming if specified
+                      if start_sec is not None or end_sec is not None:
+                          trimmed_fp = cd / f'v_{vid}_trimmed.{result["e"]}'
+                          if trim_video(fp, trimmed_fp, start_sec, end_sec):
+                              fp.unlink()  # Remove original
+                              fp = trimmed_fp  # Use trimmed version for splitting
+                              print(f'✅ Trimmed version saved')
+                      
                       split_file(fp, SP)
+                  else:
+                      print('❌ Download failed')
               else:
                   print('❌ Failed'); sys.exit(1)
           
