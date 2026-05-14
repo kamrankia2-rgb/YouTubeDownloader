@@ -13,6 +13,7 @@ on:
           - channel
           - search
           - trim
+          - trim-batch
         default: 'single'
       url:
         description: '🎬 URL or Search Query or channel name (@ChannelName or ChannelName)'
@@ -38,6 +39,11 @@ on:
         default: ''
       trim_end:
         description: '✂️ Trim End Time (only for trim mode - e.g., 00:03:45 or 225)'
+        required: false
+        type: string
+        default: ''
+      trim_segments:
+        description: '📋 Batch Trim Segments (for trim-batch mode) - Format: start1-end1,start2-end2 (e.g., 00:01:30-00:03:45,00:05:00-00:07:30,90-180)'
         required: false
         type: string
         default: ''
@@ -102,6 +108,7 @@ jobs:
           QUALITY: ${{ github.event.inputs.quality }}
           TRIM_START: ${{ github.event.inputs.trim_start }}
           TRIM_END: ${{ github.event.inputs.trim_end }}
+          TRIM_SEGMENTS: ${{ github.event.inputs.trim_segments }}
           MAX: ${{ github.event.inputs.max_videos }}
           SPLIT: ${{ github.event.inputs.split_threshold_mb }}
         run: |
@@ -119,6 +126,7 @@ jobs:
           SP = int(os.environ.get('SPLIT', '50'))
           TRIM_START = os.environ.get('TRIM_START', '').strip()
           TRIM_END = os.environ.get('TRIM_END', '').strip()
+          TRIM_SEGMENTS = os.environ.get('TRIM_SEGMENTS', '').strip()
 
           API = 'https://hub.ytconvert.org/api/download'
           H = {
@@ -151,13 +159,41 @@ jobs:
               else:
                   raise ValueError(f"Invalid time format: {time_str}")
 
+          def parse_trim_segments(segments_str):
+              """Parse trim segments from string format: 'start1-end1,start2-end2'"""
+              segments = []
+              if not segments_str:
+                  return segments
+              
+              for segment in segments_str.split(','):
+                  segment = segment.strip()
+                  if '-' in segment:
+                      parts = segment.split('-')
+                      if len(parts) == 2:
+                          start_str = parts[0].strip()
+                          end_str = parts[1].strip()
+                          try:
+                              start_sec = time_to_seconds(start_str) if start_str else None
+                              end_sec = time_to_seconds(end_str) if end_str else None
+                              if start_sec is not None and end_sec is not None:
+                                  if start_sec < end_sec:
+                                      segments.append((start_sec, end_sec))
+                                  else:
+                                      print(f'   ⚠️ Invalid segment: {segment} (start >= end)')
+                              else:
+                                  print(f'   ⚠️ Invalid segment: {segment}')
+                          except ValueError as e:
+                              print(f'   ⚠️ Invalid time format in segment: {segment} - {e}')
+                  else:
+                      print(f'   ⚠️ Invalid segment format: {segment} (expected start-end)')
+              
+              return segments
+
           def trim_video(input_path, output_path, start_time, end_time):
               """Trim video using ffmpeg"""
               if not start_time and not end_time:
                   return True
               
-              # For better precision with trimming, don't use stream copy for cuts
-              # but re-encode for accurate cuts
               cmd = ['ffmpeg', '-i', str(input_path)]
               
               if start_time:
@@ -192,6 +228,21 @@ jobs:
               except Exception as e:
                   print(f'   ❌ Trimming failed: {e}')
                   return False
+
+          def get_video_title(video_url):
+              """Get YouTube video title using yt-dlp"""
+              try:
+                  cmd = ['yt-dlp', '--get-title', '--no-warnings', '--no-check-certificate', video_url]
+                  result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+                  if result.returncode == 0 and result.stdout.strip():
+                      title = result.stdout.strip()
+                      # Sanitize title for filename
+                      title = re.sub(r'[<>:"/\\|?*]', '_', title)
+                      title = re.sub(r'\s+', ' ', title).strip()
+                      return title
+              except Exception as e:
+                  print(f'   ⚠️ Could not get title: {e}')
+              return None
 
           def safe_name(text, maxlen=40):
               safe = re.sub(r'[^\w]', '_', text)[:maxlen]
@@ -452,6 +503,19 @@ jobs:
                   print(f'❌ Invalid time format: {e}')
                   sys.exit(1)
 
+          # Parse batch trim segments
+          if M == 'trim-batch':
+              segments = parse_trim_segments(TRIM_SEGMENTS)
+              if not segments:
+                  print('❌ No valid trim segments provided for batch trim mode')
+                  print('   Format example: 00:01:30-00:03:45,00:05:00-00:07:30,90-180')
+                  sys.exit(1)
+              
+              print(f'📋 BATCH TRIM MODE ENABLED')
+              print(f'   {len(segments)} segments to process:')
+              for i, (start, end) in enumerate(segments, 1):
+                  print(f'      Segment {i}: {start}s → {end}s (duration: {end-start}s)')
+
           print(f'{"="*50}')
           print(f'🎬 {M.upper()} MODE')
           print(f'{"="*50}')
@@ -477,6 +541,100 @@ jobs:
               Path(f).write_text(m)
               Path('/tmp/meta.json').write_text(json.dumps({'m': 'search', 'ok': 0}))
               print(f'✅ {f}')
+
+          elif M == 'trim-batch':
+              # Batch trim mode - download once, create multiple trimmed clips
+              print(f'\n📦 Processing batch trim request...')
+              
+              # Extract video ID from URL
+              vid_match = re.search(r'(?:v=|/)([\w-]{11})', U)
+              if not vid_match:
+                  print('❌ Invalid YouTube URL')
+                  sys.exit(1)
+              
+              vid = vid_match.group(1)
+              
+              # Get video title for naming
+              print(f'   Fetching video title...')
+              video_title = get_video_title(U)
+              if not video_title:
+                  video_title = f'video_{vid}'
+              else:
+                  # Sanitize title for filename
+                  video_title = re.sub(r'[<>:"/\\|?*]', '_', video_title)
+                  video_title = re.sub(r'\s+', ' ', video_title).strip()
+              
+              # Get video info
+              ch, views, duration, handle = gv(vid)
+              cn = handle if handle else get_channel_from_url(U) or safe_name(ch, 30) or 'video'
+              
+              print(f'   Video: {video_title}')
+              print(f'   Video ID: {vid}')
+              print(f'   Duration: {duration//60}:{duration%60:02d}')
+              print(f'   Channel: {ch}')
+              print(f'   Segments to extract: {len(segments)}')
+              
+              # Download the video once
+              result = dl_video(U)
+              if result:
+                  cd = Path(f'downloads/{cn}_videos')
+                  cd.mkdir(parents=True, exist_ok=True)
+                  
+                  # Create a subfolder for batch trims
+                  batch_folder = cd / f'{video_title}_clips'
+                  batch_folder.mkdir(parents=True, exist_ok=True)
+                  
+                  # Download the full video to a temporary file
+                  temp_fp = batch_folder / f'{vid}_full_temp.{result["e"]}'
+                  size = download_file(result['u'], temp_fp)
+                  
+                  if size:
+                      print(f'   ✅ Full video downloaded ({size/1e6:.1f}MB)')
+                      print(f'   📁 Processing {len(segments)} trim segments...\n')
+                      
+                      successful = 0
+                      for i, (start_sec, end_sec) in enumerate(segments, 1):
+                          print(f'   📍 Segment {i}/{len(segments)}: {start_sec}s → {end_sec}s (duration: {end_sec-start_sec}s)')
+                          
+                          # Create filename for this segment
+                          start_str = f"{start_sec//3600:02d}-{(start_sec%3600)//60:02d}-{start_sec%60:02d}"
+                          end_str = f"{end_sec//3600:02d}-{(end_sec%3600)//60:02d}-{end_sec%60:02d}"
+                          
+                          # Use video title and segment times
+                          if len(segments) > 1:
+                              segment_filename = f"{video_title}_clip_{i:02d}_{start_str}_to_{end_str}_trimmed.{result['e']}"
+                          else:
+                              segment_filename = f"{video_title}_{start_str}_to_{end_str}_trimmed.{result['e']}"
+                          
+                          final_fp = batch_folder / segment_filename
+                          
+                          # Trim and save
+                          if trim_video(temp_fp, final_fp, start_sec, end_sec):
+                              print(f'   ✅ Segment {i} saved: {segment_filename}')
+                              # Apply splitting if needed
+                              split_file(final_fp, SP)
+                              successful += 1
+                          else:
+                              print(f'   ❌ Segment {i} failed')
+                          
+                          print()
+                      
+                      # Clean up temporary file
+                      temp_fp.unlink()
+                      
+                      print(f'   {"="*40}')
+                      print(f'   ✅ Batch trim complete: {successful}/{len(segments)} segments saved')
+                      print(f'   📁 Location: {batch_folder}/')
+                      print(f'   {"="*40}')
+                      
+                      if successful == 0:
+                          sys.exit(1)
+                  else:
+                      print('   ❌ Download failed')
+                      sys.exit(1)
+              else:
+                  print('❌ Failed to download video')
+                  sys.exit(1)
 
           elif M == 'trim':
               # Trim mode - download a single video and trim it
