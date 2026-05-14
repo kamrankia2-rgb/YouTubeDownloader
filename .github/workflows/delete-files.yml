@@ -1,0 +1,269 @@
+name: 🗑️ Delete Downloaded Files
+
+on:
+  workflow_dispatch:
+    inputs:
+      delete_mode:
+        description: '🗑️ Delete Mode'
+        required: true
+        type: choice
+        options:
+          - all
+          - specific
+          - dry-run
+        default: 'dry-run'
+      folder_path:
+        description: '📁 Specific folder to delete (e.g., downloads/ChannelName_videos or downloads/My Video_clips) - Only for "specific" mode'
+        required: false
+        type: string
+        default: ''
+      confirm_delete:
+        description: '⚠️ Type "CONFIRM" to proceed with deletion (required for all and specific modes)'
+        required: true
+        type: string
+        default: ''
+
+env:
+  PYTHONUNBUFFERED: '1'
+
+jobs:
+  delete-files:
+    name: 🗑️ Delete Files from Repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 1
+
+      - name: 🗑️ Delete Files
+        run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🗑️ DELETE FILES FROM REPOSITORY"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+          
+          DELETE_MODE="${{ github.event.inputs.delete_mode }}"
+          FOLDER_PATH="${{ github.event.inputs.folder_path }}"
+          CONFIRM="${{ github.event.inputs.confirm_delete }}"
+          
+          echo "📋 Mode: $DELETE_MODE"
+          echo ""
+          
+          # Check confirmation for all and specific modes
+          if [[ "$DELETE_MODE" == "all" ]] || [[ "$DELETE_MODE" == "specific" ]]; then
+            if [[ "$CONFIRM" != "CONFIRM" ]]; then
+              echo "❌ Deletion cancelled: You must type 'CONFIRM' to proceed with deletion"
+              echo "   This is a safety measure to prevent accidental data loss"
+              exit 1
+            fi
+          fi
+          
+          # Function to list files with sizes
+          list_files() {
+            local dir=$1
+            if [ -d "$dir" ]; then
+              echo "   📁 Contents of $dir:"
+              find "$dir" -type f -not -path "*/\.*" | while read -r file; do
+                size=$(du -h "$file" | cut -f1)
+                echo "      📄 $(basename "$file") ($size)"
+              done
+            else
+              echo "   📁 $dir does not exist"
+            fi
+          }
+          
+          # Dry run mode - just show what would be deleted
+          if [[ "$DELETE_MODE" == "dry-run" ]]; then
+            echo "🔍 DRY RUN MODE - No files will be deleted"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo ""
+            
+            # Check downloads folder
+            if [ -d "downloads" ]; then
+              echo "📁 Found downloads folder:"
+              find downloads -type d -mindepth 1 -maxdepth 1 2>/dev/null | while read -r folder; do
+                folder_name=$(basename "$folder")
+                file_count=$(find "$folder" -type f 2>/dev/null | wc -l)
+                folder_size=$(du -sh "$folder" 2>/dev/null | cut -f1)
+                echo "   📂 $folder_name - $file_count files, $folder_size"
+                
+                # List top 5 files in each folder
+                echo "      Files:"
+                find "$folder" -type f -not -path "*/\.*" 2>/dev/null | head -5 | while read -r file; do
+                  size=$(du -h "$file" 2>/dev/null | cut -f1)
+                  echo "         📄 $(basename "$file") ($size)"
+                done
+                if [ $(find "$folder" -type f 2>/dev/null | wc -l) -gt 5 ]; then
+                  echo "         ... and more"
+                fi
+                echo ""
+              done
+              
+              # Overall stats
+              total_files=$(find downloads -type f 2>/dev/null | wc -l)
+              total_size=$(du -sh downloads 2>/dev/null | cut -f1)
+              echo "📊 SUMMARY:"
+              echo "   Total folders: $(find downloads -type d -mindepth 1 -maxdepth 1 2>/dev/null | wc -l)"
+              echo "   Total files: $total_files"
+              echo "   Total size: $total_size"
+            else
+              echo "📁 No downloads folder found"
+            fi
+            
+            echo ""
+            echo "✅ Dry run completed. No files were deleted."
+            echo "   To actually delete files, use 'all' or 'specific' mode with confirmation."
+            exit 0
+          fi
+          
+          # All mode - delete everything in downloads folder
+          if [[ "$DELETE_MODE" == "all" ]]; then
+            echo "🗑️ DELETING ALL DOWNLOADED FILES"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            
+            if [ -d "downloads" ]; then
+              # Show what will be deleted
+              total_files=$(find downloads -type f 2>/dev/null | wc -l)
+              total_size=$(du -sh downloads 2>/dev/null | cut -f1)
+              
+              echo ""
+              echo "📊 Files to be deleted:"
+              echo "   Total files: $total_files"
+              echo "   Total size: $total_size"
+              echo ""
+              
+              # List all folders and files
+              find downloads -type d -mindepth 1 -maxdepth 1 2>/dev/null | while read -r folder; do
+                folder_name=$(basename "$folder")
+                file_count=$(find "$folder" -type f 2>/dev/null | wc -l)
+                folder_size=$(du -sh "$folder" 2>/dev/null | cut -f1)
+                echo "   📂 $folder_name - $file_count files, $folder_size"
+              done
+              
+              echo ""
+              echo "⚠️  Starting deletion..."
+              
+              # Delete everything
+              rm -rf downloads/*
+              
+              # Also delete any temp files
+              rm -rf temp_downloads 2>/dev/null
+              rm -rf temp_* 2>/dev/null
+              
+              echo ""
+              echo "✅ All downloaded files have been deleted"
+            else
+              echo "📁 No downloads folder found - nothing to delete"
+            fi
+            
+            exit 0
+          fi
+          
+          # Specific mode - delete a specific folder
+          if [[ "$DELETE_MODE" == "specific" ]]; then
+            if [ -z "$FOLDER_PATH" ]; then
+              echo "❌ Error: folder_path is required for specific mode"
+              exit 1
+            fi
+            
+            echo "🗑️ DELETING SPECIFIC FOLDER"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo ""
+            echo "📁 Target folder: $FOLDER_PATH"
+            echo ""
+            
+            # Check if path exists
+            if [ -d "$FOLDER_PATH" ]; then
+              # Show what will be deleted
+              file_count=$(find "$FOLDER_PATH" -type f 2>/dev/null | wc -l)
+              folder_size=$(du -sh "$FOLDER_PATH" 2>/dev/null | cut -f1)
+              
+              echo "📊 Files to be deleted:"
+              echo "   Files: $file_count"
+              echo "   Size: $folder_size"
+              echo ""
+              echo "📄 Contents:"
+              
+              # List files
+              find "$FOLDER_PATH" -type f -not -path "*/\.*" 2>/dev/null | head -10 | while read -r file; do
+                size=$(du -h "$file" 2>/dev/null | cut -f1)
+                echo "   📄 $(basename "$file") ($size)"
+              done
+              
+              if [ $file_count -gt 10 ]; then
+                echo "   ... and $((file_count - 10)) more files"
+              fi
+              
+              echo ""
+              echo "⚠️  Starting deletion..."
+              
+              # Delete the folder
+              rm -rf "$FOLDER_PATH"
+              
+              echo ""
+              echo "✅ Folder deleted: $FOLDER_PATH"
+            else
+              echo "❌ Folder not found: $FOLDER_PATH"
+              echo ""
+              echo "📁 Available folders in downloads:"
+              if [ -d "downloads" ]; then
+                find downloads -type d -mindepth 1 -maxdepth 1 2>/dev/null | while read -r folder; do
+                  echo "   • $(basename "$folder")"
+                done
+              else
+                echo "   No downloads folder found"
+              fi
+              exit 1
+            fi
+            
+            exit 0
+          fi
+          
+          echo "❌ Invalid delete mode: $DELETE_MODE"
+          exit 1
+
+      - name: 📤 Commit and Push Changes
+        if: github.event.inputs.delete_mode != 'dry-run' && github.event.inputs.confirm_delete == 'CONFIRM'
+        run: |
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "📤 PUSHING CHANGES TO GITHUB"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          
+          git config user.name "github-actions[bot]"
+          git config user.email "bot@github.com"
+          
+          # Check if there are changes
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "✅ No changes to commit"
+            exit 0
+          fi
+          
+          echo ""
+          echo "📋 Changes to be committed:"
+          git status --short
+          echo ""
+          
+          echo "📤 Committing and pushing..."
+          git add -A
+          git commit -m "🗑️ Delete downloaded files [skip ci]" --quiet
+          
+          # Push with retry
+          for i in 1 2 3 4 5; do
+            echo -n "   🚀 Attempt $i/5..."
+            if git pull --rebase --quiet 2>/dev/null && git push --quiet 2>/dev/null; then
+              echo " ✅ DONE!"
+              exit 0
+            fi
+            echo " ❌"
+            git rebase --abort 2>/dev/null
+            [ $i -lt 5 ] && sleep $((i*5))
+          done
+          
+          echo "   ❌ Push failed"
+          exit 1
