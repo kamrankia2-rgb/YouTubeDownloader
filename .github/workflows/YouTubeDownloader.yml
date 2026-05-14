@@ -144,7 +144,12 @@ jobs:
               return filename.strip()
 
           def extract_video_id(url):
-              """Extract YouTube video ID from URL"""
+              """Extract YouTube video ID from URL or return the string if it's already an ID"""
+              # If it's already just an ID (11 characters of alphanumeric and underscore/dash)
+              if re.match(r'^[\w-]{11}$', url):
+                  return url
+              
+              # Extract from various YouTube URL formats
               patterns = [
                   r'(?:v=|\/)([0-9A-Za-z_-]{11})(?:[?&]|$)',
                   r'(?:embed\/)([0-9A-Za-z_-]{11})',
@@ -160,48 +165,53 @@ jobs:
               """Get YouTube video title using multiple methods"""
               video_id = extract_video_id(url)
               if not video_id:
+                  print(f'   ⚠️ Could not extract video ID from URL: {url}')
                   return None
               
-              # Method 1: Try yt-dlp with direct output
+              print(f'   Fetching title for video ID: {video_id}')
+              
+              # Method 1: Try yt-dlp with direct output (most reliable)
               try:
-                  print(f'   Fetching title for video ID: {video_id}')
-                  cmd = ['yt-dlp', '--get-title', '--no-warnings', '--no-check-certificate', url]
+                  # Construct full YouTube URL if we only have ID
+                  video_url = f'https://www.youtube.com/watch?v={video_id}'
+                  cmd = ['yt-dlp', '--get-title', '--no-warnings', '--no-check-certificate', video_url]
                   result = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
                   if result.returncode == 0 and result.stdout.strip():
                       title = result.stdout.strip()
-                      print(f'   ✓ Got title via yt-dlp: {title[:50]}...')
+                      print(f'   ✓ Got title via yt-dlp: "{title}"')
                       return title
               except Exception as e:
                   print(f'   ⚠️ yt-dlp title fetch failed: {e}')
               
               # Method 2: Try using oEmbed API (no API key needed)
               try:
-                  oembed_url = f'https://www.youtube.com/oembed?url={urllib.parse.quote(url)}&format=json'
-                  response = rq.get(oembed_url, timeout=10)
+                  video_url = f'https://www.youtube.com/watch?v={video_id}'
+                  oembed_url = f'https://www.youtube.com/oembed?url={urllib.parse.quote(video_url)}&format=json'
+                  response = rq.get(oembed_url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
                   if response.status_code == 200:
                       data = response.json()
                       title = data.get('title')
                       if title:
-                          print(f'   ✓ Got title via oEmbed: {title[:50]}...')
+                          print(f'   ✓ Got title via oEmbed: "{title}"')
                           return title
               except Exception as e:
                   print(f'   ⚠️ oEmbed fetch failed: {e}')
               
-              # Method 3: Try YouTube's info API (no API key needed for basic info)
+              # Method 3: Try YouTube's page and parse HTML
               try:
-                  info_url = f'https://www.youtube.com/watch?v={video_id}'
-                  response = rq.get(info_url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
+                  video_url = f'https://www.youtube.com/watch?v={video_id}'
+                  response = rq.get(video_url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
                   if response.status_code == 200:
                       # Try to extract title from HTML
                       title_match = re.search(r'<title>(.*?)</title>', response.text)
                       if title_match:
                           title = title_match.group(1).replace(' - YouTube', '')
-                          print(f'   ✓ Got title from HTML: {title[:50]}...')
+                          print(f'   ✓ Got title from HTML: "{title}"')
                           return title
               except Exception as e:
                   print(f'   ⚠️ HTML parsing failed: {e}')
               
-              print(f'   ❌ All title fetching methods failed')
+              print(f'   ❌ All title fetching methods failed for {video_id}')
               return None
 
           def time_to_seconds(time_str):
@@ -532,7 +542,10 @@ jobs:
               if not video_title:
                   print('   ⚠️ Could not fetch video title, using video ID as fallback')
                   video_id = extract_video_id(U)
-                  video_title = f"video_{video_id}" if video_id else "youtube_video"
+                  video_title = f"youtube_video_{video_id}" if video_id else "youtube_video"
+              else:
+                  # Clean up the title for filename
+                  video_title = sanitize_filename(video_title)
               
               print(f'   📹 Video Title: {video_title}')
               
@@ -547,9 +560,6 @@ jobs:
                   cd = Path(f'downloads/{channel_name}_videos')
                   cd.mkdir(parents=True, exist_ok=True)
                   
-                  # Create sanitized filename from YouTube title
-                  base_filename = sanitize_filename(video_title)
-                  
                   # Create trimmed filename with proper formatting
                   trim_suffix = ""
                   if TRIM_START:
@@ -561,8 +571,8 @@ jobs:
                       trim_suffix += f"_to_{end_clean}"
                   
                   # Final filename: "Video Title_from_01-30_to_03-45_trimmed.mp4"
-                  final_filename = f"{base_filename}{trim_suffix}_trimmed.{result['e']}"
-                  temp_fp = cd / f"{base_filename}_temp.{result['e']}"
+                  final_filename = f"{video_title}{trim_suffix}_trimmed.{result['e']}"
+                  temp_fp = cd / f"{video_title}_temp.{result['e']}"
                   final_fp = cd / final_filename
                   
                   print(f'   💾 Will save as: {final_filename}')
@@ -647,7 +657,10 @@ jobs:
               if not video_title:
                   print('   ⚠️ Could not fetch video title, using video ID as fallback')
                   video_id = extract_video_id(U)
-                  video_title = f"video_{video_id}" if video_id else "youtube_video"
+                  video_title = f"youtube_video_{video_id}" if video_id else "youtube_video"
+              else:
+                  # Clean up the title for filename
+                  video_title = sanitize_filename(video_title)
               
               print(f'   📹 Video Title: {video_title}')
               
@@ -662,15 +675,14 @@ jobs:
                   cd.mkdir(parents=True, exist_ok=True)
                   
                   # Use sanitized YouTube title as filename
-                  filename = sanitize_filename(video_title)
-                  fp = cd / f'{filename}.{result["e"]}'
+                  fp = cd / f'{video_title}.{result["e"]}'
                   
-                  print(f'   💾 Will save as: {filename}.{result["e"]}')
+                  print(f'   💾 Will save as: {video_title}.{result["e"]}')
                   
                   size = download_file(result['u'], fp)
                   if size:
                       print(f'✅ Saved to {channel_name}_videos/ ({size/1e6:.1f}MB)')
-                      print(f'   Filename: {filename}.{result["e"]}')
+                      print(f'   Filename: {video_title}.{result["e"]}')
                       split_file(fp, SP)
                   else:
                       print('❌ Download failed')
