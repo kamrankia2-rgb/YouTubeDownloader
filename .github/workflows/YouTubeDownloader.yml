@@ -87,21 +87,25 @@ jobs:
           pip3 install -U -q yt-dlp
           command -v zip &>/dev/null || (sudo apt-get update -qq && sudo apt-get install -y -qq zip)
           command -v ffmpeg &>/dev/null || (sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg)
+          yt-dlp --version
 
       - name: 🍪 Prepare cookies (if available)
         env:
           YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
         run: |
           if [ -n "$YOUTUBE_COOKIES" ]; then
-            echo "$YOUTUBE_COOKIES" > /tmp/cookies.txt
+            # Write cookies carefully (preserve newlines)
+            printf '%s\n' "$YOUTUBE_COOKIES" > /tmp/cookies.txt
             echo "✅ Cookies file created ($(wc -c < /tmp/cookies.txt) bytes)"
-            if grep -q "youtube.com" /tmp/cookies.txt; then
-              echo "   Contains youtube.com cookies"
+            echo "   First few lines:"
+            head -n 5 /tmp/cookies.txt || true
+            if grep -qi "youtube\|GOOGLE\|SID\|HSID\|SSID\|APISID\|SAPISID\|LOGIN_INFO\|__Secure" /tmp/cookies.txt; then
+              echo "   ✅ Looks like valid YouTube / Google cookies"
             else
-              echo "   ⚠️ Warning: cookies file does not seem to contain youtube.com entries"
+              echo "   ⚠️ WARNING: cookies file may be incomplete or wrong format"
             fi
           else
-            echo "⚠️ No YOUTUBE_COOKIES secret found. Downloads may fail with bot detection."
+            echo "⚠️ No YOUTUBE_COOKIES secret found."
           fi
 
       - name: 🔗 Prepare
@@ -221,28 +225,40 @@ jobs:
                   print(f'   ❌ Trimming failed: {e}')
                   return False
 
-          def ytdlp_base_cmd():
-              """Common yt-dlp arguments that help with bot detection + cookies."""
+          def ytdlp_base_cmd(extra=None):
+              """
+              Strong anti-bot / cookie-aware base command.
+              Uses multiple player clients that currently work better.
+              """
               cmd = [
                   'yt-dlp',
                   '--no-warnings',
                   '--no-check-certificates',
-                  '--extractor-args', 'youtube:player_client=android,web,tv',
-                  '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                  '--force-ipv4',
+                  '--retries', '10',
+                  '--fragment-retries', '10',
+                  '--retry-sleep', '3',
+                  # Currently effective client combination
+                  '--extractor-args', 'youtube:player_client=android,ios,tv_embedded,web;player_skip=webpage,configs',
+                  '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
               ]
               if HAS_COOKIES:
                   cmd.extend(['--cookies', COOKIES_FILE])
+              if extra:
+                  cmd.extend(extra)
               return cmd
 
           def get_video_title(video_url):
               try:
                   cmd = ytdlp_base_cmd() + ['--get-title', video_url]
-                  result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                  result = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
                   if result.returncode == 0 and result.stdout.strip():
                       title = result.stdout.strip()
                       title = re.sub(r'[<>:"/\\|?*]', '_', title)
                       title = re.sub(r'\s+', ' ', title).strip()
                       return title
+                  else:
+                      print(f'   ⚠️ title error: {(result.stderr or "")[-200:]}')
               except Exception as e:
                   print(f'   ⚠️ Could not get title: {e}')
               return None
@@ -263,8 +279,8 @@ jobs:
 
           def gv(vid):
               try:
-                  cmd = ytdlp_base_cmd() + ['--dump-json', f'https://youtube.com/watch?v={vid}']
-                  r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                  cmd = ytdlp_base_cmd() + ['--dump-json', f'https://www.youtube.com/watch?v={vid}']
+                  r = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
                   if r.returncode == 0 and r.stdout.strip():
                       d = json.loads(r.stdout)
                       channel = (d.get('channel') or d.get('uploader') or
@@ -279,6 +295,8 @@ jobs:
                       if not handle:
                           handle = safe_name(channel, 30) if channel and channel != 'Unknown' else None
                       return (channel.strip() if channel else 'Unknown', views, int(duration) if duration else 0, handle)
+                  else:
+                      print(f'   ⚠️ gv stderr: {(r.stderr or "")[-250:]}')
               except Exception as e:
                   print(f'   ⚠️ gv error: {e}')
               return ('Unknown', None, 0, None)
@@ -297,7 +315,7 @@ jobs:
           def get_channel_from_playlist(playlist_url):
               try:
                   cmd = ytdlp_base_cmd() + ['--flat-playlist', '--dump-json', '--playlist-end', '1', playlist_url]
-                  r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                  r = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
                   if r.returncode == 0 and r.stdout.strip():
                       d = json.loads(r.stdout.strip().split('\n')[0])
                       vid = d.get('id', '')
@@ -387,27 +405,20 @@ jobs:
               return idxf
 
           def dl_with_ytdlp(url, output_path, is_audio=False, quality='720'):
-              """Download with yt-dlp using flexible format fallbacks. Returns Path or None."""
+              """Download with multiple format + client fallbacks."""
               output_path = Path(output_path)
               output_path.parent.mkdir(parents=True, exist_ok=True)
 
               tmp_template = str(output_path.with_suffix('')) + '.%(ext)s'
-
-              # Build a list of format strategies (from preferred to most permissive)
               q = quality if str(quality).isdigit() else '720'
+
               if is_audio:
-                  format_strategies = [
-                      'bestaudio/best',
-                  ]
+                  format_strategies = ['bestaudio/best']
               else:
                   format_strategies = [
-                      # Prefer mp4 video + m4a audio at or below requested height
                       f'bestvideo[height<={q}][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<={q}]+bestaudio/best[height<={q}]',
-                      # Any best video + best audio at or below height
                       f'bestvideo[height<={q}]+bestaudio/best[height<={q}]',
-                      # Best overall under the height limit
                       f'best[height<={q}]',
-                      # Absolute best available (last resort)
                       'bestvideo+bestaudio/best',
                       'best',
                   ]
@@ -419,25 +430,23 @@ jobs:
                       '-f', fmt,
                   ]
                   if not is_audio:
-                      cmd.extend(['--merge-output-format', 'mp4'])
+                      cmd += ['--merge-output-format', 'mp4']
                   else:
-                      cmd.extend(['-x', '--audio-format', 'mp3', '--audio-quality', f'{quality}k'])
+                      cmd += ['-x', '--audio-format', 'mp3', '--audio-quality', f'{quality}k']
 
                   cmd.append(url)
 
-                  print(f'   ⬇️ Trying format: {fmt[:60]}...')
+                  print(f'   ⬇️ Trying format: {fmt[:70]}...')
                   try:
-                      result = subprocess.run(cmd, capture_output=True, text=True, timeout=1200)
+                      result = subprocess.run(cmd, capture_output=True, text=True, timeout=1500)
                       if result.returncode == 0:
-                          # success – find the file
                           break
-                      else:
-                          last_error = (result.stderr or result.stdout or '')[-500:]
-                          # clean any partial files before trying next format
-                          for p in output_path.parent.glob(output_path.stem + '.*'):
-                              try: p.unlink()
-                              except: pass
-                          continue
+                      last_error = (result.stderr or result.stdout or '')[-700:]
+                      # clean partial files
+                      for p in output_path.parent.glob(output_path.stem + '.*'):
+                          try: p.unlink()
+                          except: pass
+                      continue
                   except subprocess.TimeoutExpired:
                       print('   ❌ Download timed out')
                       return None
@@ -445,11 +454,10 @@ jobs:
                       print(f'   ❌ Download error: {e}')
                       return None
               else:
-                  # all strategies failed
                   print(f'   ⚠️ All format strategies failed. Last error:\n{last_error}')
                   return None
 
-              # Locate the produced file
+              # Locate produced file
               parent = output_path.parent
               stem = output_path.stem
               candidates = [p for p in parent.glob(f'{stem}.*') if p.stat().st_size > 1000]
@@ -531,7 +539,7 @@ jobs:
           if HAS_COOKIES:
               print('🍪 Cookies: YES')
           else:
-              print('🍪 Cookies: NO (add secret YOUTUBE_COOKIES if downloads fail)')
+              print('🍪 Cookies: NO')
 
           is_audio = (T == 'audio')
           ext = 'mp3' if is_audio else 'mp4'
@@ -592,13 +600,17 @@ jobs:
               batch_folder = cd / f'{safe_name(video_title, 50)}_clips'
               batch_folder.mkdir(parents=True, exist_ok=True)
 
-              # Download the FULL video once
               temp_fp = batch_folder / f'{vid}_full_temp.{ext}'
               downloaded = dl_with_ytdlp(U, temp_fp, is_audio=is_audio, quality=Q)
 
               if not downloaded:
                   print('❌ Failed to download video')
-                  print('   → Check that your YOUTUBE_COOKIES secret is still valid')
+                  print()
+                  print('=== TROUBLESHOOTING ===')
+                  print('1. Your cookies may be expired or incomplete.')
+                  print('2. Export a FRESH cookies.txt while logged into YouTube.')
+                  print('3. Make sure the secret YOUTUBE_COOKIES contains the FULL file.')
+                  print('4. Preferred format is Netscape cookies.txt (from "Get cookies.txt LOCALLY").')
                   sys.exit(1)
 
               print(f'   📁 Processing {len(segments)} trim segments...\n')
@@ -620,7 +632,6 @@ jobs:
                       print(f'   ❌ Segment {i} failed')
                   print()
 
-              # Clean up temporary full file
               try:
                   if downloaded.exists():
                       downloaded.unlink()
