@@ -43,12 +43,12 @@ on:
         type: string
         default: ''
       trim_segments:
-        description: '📋 Batch Trim Segments (for trim-batch mode) - Format: start1-end1,start2-end2 (e.g., 00:01:30-00:03:45,00:05:00-00:07:30,90-180)'
+        description: '📋 Batch Trim Segments (for trim-batch mode) - Format: start1-end1,start2-end2'
         required: false
         type: string
         default: ''
       max_videos:
-        description: '🔢 Max results'
+        description: '🔢 Max results (playlist/channel/search)'
         required: false
         type: number
         default: 10
@@ -69,7 +69,7 @@ jobs:
     timeout-minutes: 120
     permissions:
       contents: write
-    
+
     steps:
       - uses: actions/checkout@v4
         with:
@@ -131,23 +131,35 @@ jobs:
           SPLIT: ${{ github.event.inputs.split_threshold_mb }}
         run: |
           python3 << 'PYEOF'
-          import os, json, time, re, subprocess, sys, hashlib, shutil
+          import os, json, re, subprocess, sys, hashlib
           from pathlib import Path
-          from datetime import datetime
 
+          # ---------- Config ----------
           M = os.environ['MODE']
           U = os.environ['URL']
           T = os.environ['TYPE']
-          Q = os.environ.get('QUALITY', '720')
-          MX = int(os.environ.get('MAX', '10'))
-          SP = int(os.environ.get('SPLIT', '50'))
-          TRIM_START = os.environ.get('TRIM_START', '').strip()
-          TRIM_END = os.environ.get('TRIM_END', '').strip()
-          TRIM_SEGMENTS = os.environ.get('TRIM_SEGMENTS', '').strip()
+          Q = (os.environ.get('QUALITY') or '720').strip()
+
+          mx_raw = os.environ.get('MAX', '10') or '10'
+          try:
+              MX = max(1, int(mx_raw))
+          except Exception:
+              MX = 10
+
+          sp_raw = os.environ.get('SPLIT', '50') or '50'
+          try:
+              SP = max(0, int(sp_raw))
+          except Exception:
+              SP = 50
+
+          TRIM_START    = (os.environ.get('TRIM_START') or '').strip()
+          TRIM_END      = (os.environ.get('TRIM_END') or '').strip()
+          TRIM_SEGMENTS = (os.environ.get('TRIM_SEGMENTS') or '').strip()
 
           COOKIES_FILE = '/tmp/cookies.txt'
           HAS_COOKIES = Path(COOKIES_FILE).exists() and Path(COOKIES_FILE).stat().st_size > 50
 
+          # ---------- Helpers ----------
           def time_to_seconds(time_str):
               if not time_str:
                   return None
@@ -220,7 +232,7 @@ jobs:
           def ytdlp_cmd(extra=None, for_metadata=False):
               """
               Build yt-dlp command.
-              for_metadata=True → no format selection, simpler extractor args.
+              for_metadata=True → lighter clients, no big UA override.
               """
               cmd = [
                   'yt-dlp',
@@ -234,14 +246,13 @@ jobs:
                   cmd.extend(['--cookies', COOKIES_FILE])
 
               if for_metadata:
-                  # Very simple for title / json / list-formats
+                  # Only valid clients. tv_embedded was removed upstream.
                   cmd.extend([
-                      '--extractor-args', 'youtube:player_client=web,android',
+                      '--extractor-args', 'youtube:player_client=web,mweb',
                   ])
               else:
-                  # More aggressive for actual download
                   cmd.extend([
-                      '--extractor-args', 'youtube:player_client=android,ios,web,tv_embedded',
+                      '--extractor-args', 'youtube:player_client=web,mweb,android_vr,ios',
                       '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
                   ])
 
@@ -271,13 +282,6 @@ jobs:
               if not safe:
                   safe = hashlib.md5(text.encode()).hexdigest()[:8]
               return safe
-
-          def fm(n):
-              if not n: return 'N/A'
-              try:
-                  n = int(n)
-                  return f'{n/1e6:.1f}M' if n >= 1e6 else f'{n/1e3:.1f}K' if n >= 1e3 else str(n)
-              except: return str(n)
 
           def gv(vid):
               try:
@@ -309,13 +313,11 @@ jobs:
               return None
 
           def list_formats(url):
-              """Diagnostic: print available formats"""
               print('   📋 Listing available formats (diagnostic)...')
               cmd = ytdlp_cmd(for_metadata=True) + ['--list-formats', url]
               try:
                   r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
                   out = (r.stdout or '') + (r.stderr or '')
-                  # print only the format table part
                   lines = out.splitlines()
                   printing = False
                   for line in lines:
@@ -323,7 +325,7 @@ jobs:
                           printing = True
                       if printing:
                           print('      ' + line)
-                          if line.strip() == '' and printing:
+                          if line.strip() == '':
                               break
                   if not printing:
                       print('      (no format table found)')
@@ -332,15 +334,16 @@ jobs:
                   print(f'      list-formats failed: {e}')
 
           def dl_with_ytdlp(url, output_path, is_audio=False, quality='720'):
+              """
+              Download a SINGLE video (falls back through strategies).
+              """
               output_path = Path(output_path)
               output_path.parent.mkdir(parents=True, exist_ok=True)
               tmp_template = str(output_path.with_suffix('')) + '.%(ext)s'
               q = quality if str(quality).isdigit() else '720'
 
               if is_audio:
-                  strategies = [
-                      ('bestaudio/best', True),
-                  ]
+                  strategies = [('bestaudio/best', True)]
               else:
                   strategies = [
                       (f'bestvideo[height<={q}][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<={q}]+bestaudio/best[height<={q}]', False),
@@ -367,7 +370,7 @@ jobs:
                       last_error = (result.stderr or result.stdout or '')[-600:]
                       for p in output_path.parent.glob(output_path.stem + '.*'):
                           try: p.unlink()
-                          except: pass
+                          except Exception: pass
                   except subprocess.TimeoutExpired:
                       print('   ❌ Timed out')
                       return None
@@ -376,11 +379,9 @@ jobs:
                       return None
               else:
                   print(f'   ⚠️ All strategies failed. Last error:\n{last_error}')
-                  # Run diagnostic
                   list_formats(url)
                   return None
 
-              # Find output file
               parent = output_path.parent
               stem = output_path.stem
               candidates = [p for p in parent.glob(f'{stem}.*') if p.stat().st_size > 1000]
@@ -406,22 +407,129 @@ jobs:
               return None
 
           def split_file(filepath, threshold_mb):
+              filepath = Path(filepath)
+              if not filepath.exists():
+                  return False
               size_mb = filepath.stat().st_size / 1e6
               if threshold_mb > 0 and size_mb > threshold_mb:
-                  print(f'   ✂️ Splitting ({size_mb:.0f}MB)...')
+                  print(f'   ✂️ Splitting {filepath.name} ({size_mb:.0f}MB)...')
                   parent = filepath.parent
                   name = filepath.name
-                  subprocess.run(['zip', '-r', '-q', '-s', f'{threshold_mb}m', f'{name}.zip', name], cwd=parent, check=True)
-                  filepath.unlink()
-                  print(f'   ✅ Split done')
-                  return True
+                  try:
+                      subprocess.run(
+                          ['zip', '-r', '-q', '-s', f'{threshold_mb}m', f'{name}.zip', name],
+                          cwd=parent, check=True,
+                      )
+                      filepath.unlink()
+                      print(f'   ✅ Split done')
+                      return True
+                  except Exception as e:
+                      print(f'   ⚠️ Split failed: {e}')
+                      return False
               return False
 
-          # ---------- Parse trim ----------
+          def split_all_in_folder(folder, threshold_mb):
+              """Split every oversized file in a folder (recursively)."""
+              if threshold_mb <= 0:
+                  return
+              folder = Path(folder)
+              if not folder.exists():
+                  return
+              for f in sorted(folder.rglob('*')):
+                  if not f.is_file():
+                      continue
+                  if f.name.endswith('.zip'):
+                      continue
+                  if f.stat().st_size > threshold_mb * 1e6:
+                      split_file(f, threshold_mb)
+
+          def download_playlist_generic(source, is_audio, quality, max_videos, folder_hint=None):
+              """
+              Download from a playlist / channel / search source.
+              `source` can be a URL or 'ytsearchN:query'.
+              Returns the base folder path on success, else None.
+              """
+              max_videos = max(1, int(max_videos))
+
+              # ---- Determine base folder ----
+              base_folder = None
+              if folder_hint:
+                  base_folder = Path('downloads') / safe_name(folder_hint, 60)
+              else:
+                  try:
+                      cmd = ytdlp_cmd(for_metadata=True) + [
+                          '--flat-playlist',
+                          '--dump-single-json',
+                          '--playlist-end', '1',
+                          source,
+                      ]
+                      r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+                      if r.returncode == 0 and r.stdout.strip():
+                          info = json.loads(r.stdout)
+                          title = info.get('title') or info.get('playlist_title') or 'download'
+                          base_folder = Path('downloads') / safe_name(title, 60)
+                      else:
+                          print(f'   ⚠️ metadata stderr: {(r.stderr or "")[-300:]}')
+                  except Exception as e:
+                      print(f'   ⚠️ metadata error: {e}')
+                  if not base_folder:
+                      base_folder = Path('downloads') / ('playlist_' + hashlib.md5(source.encode()).hexdigest()[:8])
+
+              base_folder.mkdir(parents=True, exist_ok=True)
+
+              # ---- Output template ----
+              output_template = str(base_folder / '%(playlist_index)03d - %(title)s.%(ext)s')
+
+              if is_audio:
+                  fmt = 'bestaudio/best'
+                  postprocessors = ['-x', '--audio-format', 'mp3', '--audio-quality', f'{quality}k']
+              else:
+                  q = quality if str(quality).isdigit() else '720'
+                  fmt = (f'bestvideo[height<={q}][ext=mp4]+bestaudio[ext=m4a]/'
+                         f'bestvideo[height<={q}]+bestaudio/best[height<={q}]')
+                  postprocessors = ['--merge-output-format', 'mp4']
+
+              # ---- Assemble command ----
+              cmd = ytdlp_cmd() + [
+                  '-o', output_template,
+                  '-f', fmt,
+                  '--playlist-end', str(max_videos),
+                  '--ignore-errors',
+                  '--sleep-requests', '1',
+              ] + postprocessors + [source]
+
+              print(f'⬇️ Downloading up to {max_videos} item(s) → {base_folder}/')
+              try:
+                  result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+                  if result.returncode == 0:
+                      print('✅ Download completed cleanly.')
+                  else:
+                      tail = (result.stderr or result.stdout or '')[-800:]
+                      print(f'⚠️ Download finished with warnings/errors:\n{tail}')
+              except subprocess.TimeoutExpired:
+                  print('❌ Download timed out.')
+              except Exception as e:
+                  print(f'❌ Download failed: {e}')
+
+              # ---- Post-processing: split oversized files ----
+              split_all_in_folder(base_folder, SP)
+
+              # ---- Count result ----
+              files = [f for f in base_folder.rglob('*') if f.is_file()]
+              if not files:
+                  print('❌ No files were downloaded.')
+                  return None
+
+              total_mb = sum(f.stat().st_size for f in files) / 1e6
+              print(f'📊 {len(files)} file(s), {total_mb:.1f} MB total → {base_folder}/')
+              return base_folder
+
+          # ---------- Pre-checks for trim modes ----------
+          start_sec = end_sec = None
           if M == 'trim':
               try:
                   start_sec = time_to_seconds(TRIM_START) if TRIM_START else None
-                  end_sec = time_to_seconds(TRIM_END) if TRIM_END else None
+                  end_sec   = time_to_seconds(TRIM_END)   if TRIM_END   else None
                   if not TRIM_START and not TRIM_END:
                       print('❌ Need at least start or end time'); sys.exit(1)
                   if start_sec is not None and end_sec is not None and start_sec >= end_sec:
@@ -430,18 +538,21 @@ jobs:
               except ValueError as e:
                   print(f'❌ {e}'); sys.exit(1)
 
+          segments = []
           if M == 'trim-batch':
               segments = parse_trim_segments(TRIM_SEGMENTS)
               if not segments:
                   print('❌ No valid segments'); sys.exit(1)
-              print(f'📋 BATCH TRIM – {len(segments)} segments')
-              for i,(s,e) in enumerate(segments,1):
+              print(f'📋 BATCH TRIM – {len(segments)} segment(s)')
+              for i, (s, e) in enumerate(segments, 1):
                   print(f'   {i}: {s}s → {e}s')
 
-          print('='*50)
-          print(f'🎬 {M.upper()} MODE')
-          print('='*50)
+          # ---------- Header ----------
+          print('=' * 50)
+          print(f'🎬 MODE: {M.upper()}')
+          print('=' * 50)
           print('🍪 Cookies:', 'YES' if HAS_COOKIES else 'NO')
+          print(f'📦 Output: {"audio" if T == "audio" else "video"} | quality={Q} | split>{SP}MB | max={MX}')
 
           is_audio = (T == 'audio')
           ext = 'mp3' if is_audio else 'mp4'
@@ -474,20 +585,18 @@ jobs:
 
               temp_fp = batch_folder / f'{vid}_full_temp.{ext}'
               downloaded = dl_with_ytdlp(U, temp_fp, is_audio=is_audio, quality=Q)
-
               if not downloaded:
-                  print('❌ Download failed')
-                  sys.exit(1)
+                  print('❌ Download failed'); sys.exit(1)
 
-              print(f'\n   Processing {len(segments)} clips...')
+              print(f'\n   Processing {len(segments)} clip(s)...')
               successful = 0
-              for i, (start_sec, end_sec) in enumerate(segments, 1):
-                  print(f'\n   📍 Clip {i}/{len(segments)}: {start_sec}s → {end_sec}s')
-                  start_str = f'{start_sec//3600:02d}-{(start_sec%3600)//60:02d}-{start_sec%60:02d}'
-                  end_str   = f'{end_sec//3600:02d}-{(end_sec%3600)//60:02d}-{end_sec%60:02d}'
+              for i, (s, e) in enumerate(segments, 1):
+                  print(f'\n   📍 Clip {i}/{len(segments)}: {s}s → {e}s')
+                  start_str = f'{s//3600:02d}-{(s%3600)//60:02d}-{s%60:02d}'
+                  end_str   = f'{e//3600:02d}-{(e%3600)//60:02d}-{e%60:02d}'
                   name = f'{safe_name(video_title,40)}_clip_{i:02d}_{start_str}_to_{end_str}_trimmed.{ext}'
                   final_fp = batch_folder / name
-                  if trim_video(downloaded, final_fp, start_sec, end_sec):
+                  if trim_video(downloaded, final_fp, s, e):
                       split_file(final_fp, SP)
                       successful += 1
                   else:
@@ -495,7 +604,7 @@ jobs:
 
               try:
                   if downloaded.exists(): downloaded.unlink()
-              except: pass
+              except Exception: pass
 
               print(f'\n   {"="*40}')
               print(f'   ✅ {successful}/{len(segments)} clips saved')
@@ -530,15 +639,46 @@ jobs:
                   try:
                       if downloaded.exists() and downloaded != final_fp:
                           downloaded.unlink()
-                  except: pass
+                  except Exception: pass
                   print(f'   ✅ Saved {final_fp.name}')
                   split_file(final_fp, SP)
               else:
                   print('❌ Trim failed'); sys.exit(1)
 
+          # ==================== PLAYLIST ====================
+          elif M == 'playlist':
+              print('\n📥 Playlist mode')
+              result = download_playlist_generic(U, is_audio, Q, MX, folder_hint=None)
+              if not result:
+                  sys.exit(1)
+
+          # ==================== CHANNEL ====================
+          elif M == 'channel':
+              print('\n📥 Channel mode')
+              # Ensure we hit the /videos tab for predictability
+              if not any(x in U for x in ('/videos', '/shorts', '/streams', '/playlists')):
+                  U = U.rstrip('/') + '/videos'
+              cn = get_channel_from_url(U)
+              hint = f'{cn}_videos' if cn else None
+              result = download_playlist_generic(U, is_audio, Q, MX, folder_hint=hint)
+              if not result:
+                  sys.exit(1)
+
+          # ==================== SEARCH ====================
+          elif M == 'search':
+              print('\n📥 Search mode')
+              query = U.strip()
+              if not query:
+                  print('❌ Empty search query'); sys.exit(1)
+              search_source = f'ytsearch{MX}:{query}'
+              hint = f'search_{safe_name(query, 40)}'
+              result = download_playlist_generic(search_source, is_audio, Q, MX, folder_hint=hint)
+              if not result:
+                  sys.exit(1)
+
           # ==================== SINGLE ====================
           else:
-              # fallback single (and other modes simplified for now)
+              print('\n📥 Single video mode')
               vid_match = re.search(r'(?:v=|/)([\w-]{11})', U)
               vid = vid_match.group(1) if vid_match else 'x'
               ch, _, _, handle = gv(vid)
@@ -552,7 +692,6 @@ jobs:
                   split_file(downloaded, SP)
               else:
                   print('❌ Failed'); sys.exit(1)
-
           PYEOF
 
       - name: 📤 Push Files
